@@ -46,6 +46,7 @@ func main() {
 	var (
 		region = flag.String("region", "eu", "CDN region: na or eu")
 		want   = flag.String("game", "", "game id, name or number; skips the interactive prompt")
+		jobs   = flag.Int("jobs", 8, "max files downloaded simultaneously")
 	)
 	flag.Parse()
 
@@ -82,7 +83,11 @@ func main() {
 		fail("%v", err)
 	}
 
-	if err := download(g, base, cwd); err != nil {
+	if *jobs < 1 {
+		fail("jobs must be at least 1")
+	}
+
+	if err := download(g, base, cwd, *jobs); err != nil {
 		fail("%v", err)
 	}
 	fmt.Fprintf(os.Stderr, "Finished! Game files are in %s\n", cwd)
@@ -154,32 +159,52 @@ func totalSize(g game) int64 {
 	return n
 }
 
-func download(g game, base, cwd string) error {
+func download(g game, base, cwd string, jobs int) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	bar := newBar(len(g.Files), totalSize(g))
 	go bar.refreshLoop(ctx)
 
-	var done, failed int64
+	var (
+		mu     sync.Mutex
+		done   int64
+		failed int64
+	)
+	sem := make(chan struct{}, jobs)
+	var wg sync.WaitGroup
 
-	for i, f := range g.Files {
+	for _, f := range g.Files {
 		target := filepath.Join(cwd, filepath.FromSlash(f.P))
 		if fi, err := os.Stat(target); err == nil && fi.Size() == f.S {
 			bar.skip(f.S)
+			mu.Lock()
 			done++
+			mu.Unlock()
 			continue
 		}
 
-		bar.begin(i+1, f.S, filepath.Base(f.P))
-		if err := downloadFile(f, g.Folder, base, target, bar); err != nil {
-			bar.warn(fmt.Sprintf("%s: %v", f.P, err))
-			failed++
-			continue
-		}
-		bar.commit()
-		done++
+		wg.Add(1)
+		go func(f fileInfo, target string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			bar.begin()
+			if err := downloadFile(f, g.Folder, base, target, bar); err != nil {
+				bar.warn(fmt.Sprintf("%s: %v", f.P, err))
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			bar.commit()
+			mu.Lock()
+			done++
+			mu.Unlock()
+		}(f, target)
 	}
+	wg.Wait()
 
 	bar.stop()
 
@@ -258,19 +283,15 @@ func isSafe(c byte) bool {
 		c == '-' || c == '_' || c == '.' || c == '~' || c == '/'
 }
 
-// progressBar tracks a compound download of many files and renders a
-// single-line progress bar on stderr.
 type progressBar struct {
 	mu sync.Mutex
 
-	total    int64 // total bytes across all files
-	done     int64 // bytes finished across all files
-	curSize  int64 // size of the file currently downloading
-	curWrote int64 // bytes written for the current file
+	total int64
+	done  int64
 
-	fileIndex int
-	fileCount int
-	fileName  string
+	active     int
+	filesDone  int
+	filesTotal int
 
 	lastRender time.Time
 	lastBytes  int64
@@ -279,9 +300,8 @@ type progressBar struct {
 
 func newBar(files int, size int64) *progressBar {
 	return &progressBar{
-		fileCount: files,
-		total:     size,
-		fileName:  "checking files",
+		filesTotal: files,
+		total:      size,
 	}
 }
 
@@ -311,15 +331,12 @@ func (b *progressBar) render() {
 	b.lastBytes = b.done
 	b.lastRender = now
 
-	var overall, current float64
+	var overall float64
 	if b.total > 0 {
 		overall = float64(b.done) / float64(b.total) * 100
 	}
-	if b.curSize > 0 {
-		current = float64(b.curWrote) / float64(b.curSize) * 100
-	}
-	line := fmt.Sprintf("\r[%d/%d] %s  %5.1f%% of file  |  overall %5.1f%% (%s/%s)  |  %s/s",
-		b.fileIndex, b.fileCount, b.fileName, current, overall,
+	line := fmt.Sprintf("\r[%d/%d files, %d active]  overall %5.1f%%  (%s / %s)  |  %s/s",
+		b.filesDone, b.filesTotal, b.active, overall,
 		humanBytes(b.done), humanBytes(b.total), humanBytes(int64(speed)))
 
 	if len(line) < b.lastLine {
@@ -332,7 +349,6 @@ func (b *progressBar) render() {
 func (b *progressBar) add(n int64) {
 	b.mu.Lock()
 	b.done += n
-	b.curWrote += n
 	b.mu.Unlock()
 }
 
@@ -342,33 +358,29 @@ func (b *progressBar) skip(size int64) {
 	b.mu.Unlock()
 }
 
-func (b *progressBar) begin(index int, size int64, name string) {
+func (b *progressBar) begin() {
 	b.mu.Lock()
-	b.fileIndex = index
-	b.curSize = size
-	b.curWrote = 0
-	b.fileName = name
+	b.active++
 	b.mu.Unlock()
 }
 
 func (b *progressBar) commit() {
 	b.mu.Lock()
-	b.curSize = 0
-	b.curWrote = 0
-	b.fileName = "done"
+	b.active--
+	b.filesDone++
 	b.mu.Unlock()
 }
 
 func (b *progressBar) warn(msg string) {
+	b.mu.Lock()
 	fmt.Fprintf(os.Stderr, "\nWARNING: %s\n", msg)
+	b.mu.Unlock()
 }
 
 func (b *progressBar) stop() {
 	b.mu.Lock()
-	b.fileIndex = b.fileCount
-	b.fileName = "done"
-	b.curSize = 0
-	b.curWrote = 0
+	b.active = 0
+	b.filesDone = b.filesTotal
 	b.mu.Unlock()
 	b.render()
 	fmt.Fprintln(os.Stderr)
