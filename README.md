@@ -1,6 +1,6 @@
 # cb-downloader
 
-Game files downloader for the [CBServers](https://cbservers.xyz/) CDN.
+Game files downloader from the [CBServers](https://cbservers.xyz/) CDN.
 
 ## Build
 
